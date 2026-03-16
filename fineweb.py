@@ -39,12 +39,15 @@ os.makedirs(DATA_CACHE_DIR, exist_ok=True)
 enc = tiktoken.get_encoding("gpt2")
 eot = enc._special_tokens['<|endoftext|>'] # end of text token
 
-def tokenize_batch(texts):
-    """Tokenize a batch of texts in one worker call."""
+def tokenize_chunk(args):
+    """Worker reads a slice of a parquet file and tokenizes it. No IPC for input data."""
+    filepath, start_row, end_row = args
+    table = pq.read_table(filepath, columns=["text"])
+    col = table.column("text")
     all_tokens = []
-    for text in texts:
+    for i in range(start_row, min(end_row, len(col))):
         tokens = [eot]
-        tokens.extend(enc.encode_ordinary(text))
+        tokens.extend(enc.encode_ordinary(col[i].as_py()))
         tokens_np = np.array(tokens)
         assert (0 <= tokens_np).all() and (tokens_np < 2**16).all(), "token dictionary too large for uint16"
         all_tokens.append(tokens_np.astype(np.uint16))
@@ -53,74 +56,67 @@ def tokenize_batch(texts):
 def write_datafile(filename, tokens_np):
     np.save(filename, tokens_np)
 
-def generate_text_batches(parquet_files, batch_size=256):
-    """Yield batches of text strings from parquet files for parallel processing."""
-    batch = []
+def build_chunk_tasks(parquet_files, rows_per_chunk=1000):
+    """Split each parquet file into row-range chunks for parallel processing."""
+    tasks = []
     for pf in parquet_files:
-        table = pq.read_table(pf, columns=["text"])
-        col = table.column("text")
-        for i in range(len(col)):
-            batch.append(col[i].as_py())
-            if len(batch) == batch_size:
-                yield batch
-                batch = []
-    if batch:
-        yield batch
+        num_rows = pq.read_metadata(pf).num_rows
+        for start in range(0, num_rows, rows_per_chunk):
+            tasks.append((pf, start, start + rows_per_chunk))
+    return tasks
 
-def generate_text_batches_streaming(fw, batch_size=256):
-    """Yield batches from HF streaming dataset."""
-    batch = []
-    for doc in fw:
-        batch.append(doc["text"])
-        if len(batch) == batch_size:
-            yield batch
-            batch = []
-    if batch:
-        yield batch
-
-# Build the batch iterator
 if parquet_files:
-    batch_iter = generate_text_batches(parquet_files, batch_size=256)
-else:
-    batch_iter = generate_text_batches_streaming(fw_stream, batch_size=256)
+    print("Building chunk task list...")
+    chunk_tasks = build_chunk_tasks(parquet_files, rows_per_chunk=1000)
+    print(f"Created {len(chunk_tasks)} chunks across {len(parquet_files)} parquet files")
 
 # tokenize all documents and write output shards, each of shard_size tokens (last shard has remainder)
 nprocs = max(1, os.cpu_count())
-with mp.Pool(nprocs) as pool:
-    shard_index = 0
-    # preallocate buffer to hold current shard
-    all_tokens_np = np.empty((shard_size,), dtype=np.uint16)
-    token_count = 0
-    progress_bar = None
-    for token_arrays in pool.imap_unordered(tokenize_batch, batch_iter):
-        for tokens in token_arrays:
 
-            # is there enough space in the current shard for the new tokens?
-            if token_count + len(tokens) < shard_size:
-                # simply append tokens to current shard
-                all_tokens_np[token_count:token_count+len(tokens)] = tokens
-                token_count += len(tokens)
-                # update progress bar
-                if progress_bar is None:
-                    progress_bar = tqdm(total=shard_size, unit="tokens", desc=f"Shard {shard_index}")
-                progress_bar.update(len(tokens))
-            else:
-                # write the current shard and start a new one
-                split = "val" if shard_index == 0 else "train"
-                filename = os.path.join(DATA_CACHE_DIR, f"edufineweb_{split}_{shard_index:06d}")
-                # split the document into whatever fits in this shard; the remainder goes to next one
-                remainder = shard_size - token_count
-                progress_bar.update(remainder)
-                all_tokens_np[token_count:token_count+remainder] = tokens[:remainder]
-                write_datafile(filename, all_tokens_np)
-                shard_index += 1
-                progress_bar = None
-                # populate the next shard with the leftovers of the current doc
-                all_tokens_np[0:len(tokens)-remainder] = tokens[remainder:]
-                token_count = len(tokens)-remainder
+shard_index = 0
+all_tokens_np = np.empty((shard_size,), dtype=np.uint16)
+token_count = 0
+progress_bar = None
 
-    # write any remaining tokens as the last shard
-    if token_count != 0:
+def process_tokens(tokens):
+    global shard_index, all_tokens_np, token_count, progress_bar
+    if token_count + len(tokens) < shard_size:
+        all_tokens_np[token_count:token_count+len(tokens)] = tokens
+        token_count += len(tokens)
+        if progress_bar is None:
+            progress_bar = tqdm(total=shard_size, unit="tokens", desc=f"Shard {shard_index}")
+        progress_bar.update(len(tokens))
+    else:
         split = "val" if shard_index == 0 else "train"
         filename = os.path.join(DATA_CACHE_DIR, f"edufineweb_{split}_{shard_index:06d}")
-        write_datafile(filename, all_tokens_np[:token_count])
+        remainder = shard_size - token_count
+        progress_bar.update(remainder)
+        all_tokens_np[token_count:token_count+remainder] = tokens[:remainder]
+        write_datafile(filename, all_tokens_np)
+        shard_index += 1
+        progress_bar = None
+        all_tokens_np[0:len(tokens)-remainder] = tokens[remainder:]
+        token_count = len(tokens)-remainder
+
+if parquet_files:
+    with mp.Pool(nprocs) as pool:
+        for token_arrays in pool.imap_unordered(tokenize_chunk, chunk_tasks):
+            for tokens in token_arrays:
+                process_tokens(tokens)
+else:
+    # Streaming fallback (slower, for when parquets aren't available)
+    def tokenize_text(text):
+        tokens = [eot]
+        tokens.extend(enc.encode_ordinary(text))
+        tokens_np = np.array(tokens)
+        assert (0 <= tokens_np).all() and (tokens_np < 2**16).all()
+        return tokens_np.astype(np.uint16)
+    with mp.Pool(nprocs) as pool:
+        for tokens in pool.imap(tokenize_text, (doc["text"] for doc in fw_stream), chunksize=16):
+            process_tokens(tokens)
+
+# write any remaining tokens as the last shard
+if token_count != 0:
+    split = "val" if shard_index == 0 else "train"
+    filename = os.path.join(DATA_CACHE_DIR, f"edufineweb_{split}_{shard_index:06d}")
+    write_datafile(filename, all_tokens_np[:token_count])
