@@ -314,6 +314,7 @@ else:
 
 # added after video, pytorch can be serious about it's device vs. device_type distinction
 device_type = "cuda" if device.startswith("cuda") else "cpu"
+autocast_dtype = torch.bfloat16 if device_type == "cuda" and torch.cuda.is_bf16_supported() else torch.float16
 
 torch.manual_seed(1337)
 if torch.cuda.is_available():
@@ -321,13 +322,16 @@ if torch.cuda.is_available():
 
 enc = tiktoken.get_encoding("gpt2")
 
-total_batch_size = 524288 # 2**19, ~0.5M, in number of tokens
-B = 64 # micro batch size
-T = 1024 # sequence length
+total_batch_size = int(os.environ.get("TOTAL_BATCH_SIZE", 524288)) # 2**19, ~0.5M, in number of tokens
+B = int(os.environ.get("MICRO_BATCH_SIZE", 64)) # micro batch size per GPU
+T = int(os.environ.get("SEQUENCE_LENGTH", 1024)) # sequence length
 assert total_batch_size % (B * T * ddp_world_size) == 0, "make sure total_batch_size is divisible by B * T * ddp_world_size"
 grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
 if master_process:
     print(f"total desired batch size: {total_batch_size}")
+    print(f"micro batch size per GPU: {B}")
+    print(f"sequence length: {T}")
+    print(f"autocast dtype: {autocast_dtype}")
     print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
 
 train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="train")
@@ -387,7 +391,7 @@ for step in range(max_steps):
             for _ in range(val_loss_steps):
                 x, y = val_loader.next_batch()
                 x, y = x.to(device), y.to(device)
-                with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+                with torch.autocast(device_type=device_type, dtype=autocast_dtype):
                     logits, loss = model(x, y)
                 loss = loss / val_loss_steps
                 val_loss_accum += loss.detach()
@@ -424,7 +428,7 @@ for step in range(max_steps):
             mask = mask.to(device)
             # get the logits
             with torch.no_grad():
-                with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+                with torch.autocast(device_type=device_type, dtype=autocast_dtype):
                     logits, loss = model(tokens)
                 pred_norm = get_most_likely_row(tokens, mask, logits)
             num_total += 1
@@ -457,7 +461,7 @@ for step in range(max_steps):
         while xgen.size(1) < max_length:
             # forward the model to get the logits
             with torch.no_grad():
-                with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+                with torch.autocast(device_type=device_type, dtype=autocast_dtype):
                     logits, loss = model(xgen) # (B, T, vocab_size)
                 # take the logits at the last position
                 logits = logits[:, -1, :] # (B, vocab_size)
@@ -489,7 +493,7 @@ for step in range(max_steps):
         # added after video, this field is also used by the forward pass.
         if ddp:
             model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)
-        with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+        with torch.autocast(device_type=device_type, dtype=autocast_dtype):
             logits, loss = model(x, y)
         # we have to scale the loss to account for gradient accumulation,
         # because the gradients just add on each successive backward().
