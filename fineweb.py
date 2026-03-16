@@ -24,11 +24,11 @@ parquet_dir = "/workspace/.hf_home/hub/datasets--HuggingFaceFW--fineweb-edu/snap
 parquet_files = sorted(glob.glob(os.path.join(parquet_dir, "*.parquet")))
 
 if not parquet_files:
-    # Fallback: download via HF datasets streaming
     print("No local parquet files found, falling back to streaming download...")
     from datasets import load_dataset
-    fw = load_dataset("HuggingFaceFW/fineweb-edu", name="sample-10BT", split="train", streaming=True)
+    fw_stream = load_dataset("HuggingFaceFW/fineweb-edu", name="sample-10BT", split="train", streaming=True)
 else:
+    fw_stream = None
     print(f"Found {len(parquet_files)} local parquet files, reading directly (fast path)")
 
 # create the cache the local directory if it doesn't exist yet
@@ -38,30 +38,51 @@ os.makedirs(DATA_CACHE_DIR, exist_ok=True)
 # init the tokenizer
 enc = tiktoken.get_encoding("gpt2")
 eot = enc._special_tokens['<|endoftext|>'] # end of text token
-def tokenize(text):
-    # tokenizes a single document and returns a numpy array of uint16 tokens
-    tokens = [eot] # the special <|endoftext|> token delimits all documents
-    tokens.extend(enc.encode_ordinary(text))
-    tokens_np = np.array(tokens)
-    assert (0 <= tokens_np).all() and (tokens_np < 2**16).all(), "token dictionary too large for uint16"
-    tokens_np_uint16 = tokens_np.astype(np.uint16)
-    return tokens_np_uint16
+
+def tokenize_batch(texts):
+    """Tokenize a batch of texts in one worker call."""
+    all_tokens = []
+    for text in texts:
+        tokens = [eot]
+        tokens.extend(enc.encode_ordinary(text))
+        tokens_np = np.array(tokens)
+        assert (0 <= tokens_np).all() and (tokens_np < 2**16).all(), "token dictionary too large for uint16"
+        all_tokens.append(tokens_np.astype(np.uint16))
+    return all_tokens
 
 def write_datafile(filename, tokens_np):
     np.save(filename, tokens_np)
 
-def iterate_parquet_texts(parquet_files):
-    """Yield text strings from parquet files one at a time (no Arrow cache)."""
+def generate_text_batches(parquet_files, batch_size=256):
+    """Yield batches of text strings from parquet files for parallel processing."""
+    batch = []
     for pf in parquet_files:
         table = pq.read_table(pf, columns=["text"])
-        for text in table.column("text"):
-            yield text.as_py()
+        col = table.column("text")
+        for i in range(len(col)):
+            batch.append(col[i].as_py())
+            if len(batch) == batch_size:
+                yield batch
+                batch = []
+    if batch:
+        yield batch
 
-# Build the text iterator
+def generate_text_batches_streaming(fw, batch_size=256):
+    """Yield batches from HF streaming dataset."""
+    batch = []
+    for doc in fw:
+        batch.append(doc["text"])
+        if len(batch) == batch_size:
+            yield batch
+            batch = []
+    if batch:
+        yield batch
+
+# Build the batch iterator
 if parquet_files:
-    text_iter = iterate_parquet_texts(parquet_files)
+    batch_iter = generate_text_batches(parquet_files, batch_size=256)
 else:
-    text_iter = (doc["text"] for doc in fw)
+    batch_iter = generate_text_batches_streaming(fw_stream, batch_size=256)
 
 # tokenize all documents and write output shards, each of shard_size tokens (last shard has remainder)
 nprocs = max(1, os.cpu_count())
@@ -71,7 +92,8 @@ with mp.Pool(nprocs) as pool:
     all_tokens_np = np.empty((shard_size,), dtype=np.uint16)
     token_count = 0
     progress_bar = None
-    for tokens in pool.imap(tokenize, text_iter, chunksize=64):
+    for token_arrays in pool.imap_unordered(tokenize_batch, batch_iter):
+        for tokens in token_arrays:
 
         # is there enough space in the current shard for the new tokens?
         if token_count + len(tokens) < shard_size:
