@@ -27,8 +27,33 @@ shard_size = int(1e8) # 100M tokens per shard, total of 100 shards
 resume_enabled = os.environ.get("FINEWEB_RESUME", "0") == "1"
 worker_count = int(os.environ.get("TOKENIZE_PROCS", max(1, os.cpu_count() or 1)))
 
-parquet_dir = "/workspace/.hf_home/hub/datasets--HuggingFaceFW--fineweb-edu/snapshots/*/sample/10BT"
-parquet_files = sorted(glob.glob(os.path.join(parquet_dir, "*.parquet")))
+parquet_glob_override = os.environ.get("FINEWEB_PARQUET_GLOB")
+
+
+def discover_local_parquet_files():
+    candidate_globs = []
+    if parquet_glob_override:
+        candidate_globs.append(parquet_glob_override)
+
+    hf_home = os.environ.get("HF_HOME")
+    if hf_home:
+        candidate_globs.append(os.path.join(hf_home, "hub/datasets--HuggingFaceFW--fineweb-edu/snapshots/*/sample/10BT/*.parquet"))
+
+    candidate_globs.extend([
+        "/workspace/.hf_home/hub/datasets--HuggingFaceFW--fineweb-edu/snapshots/*/sample/10BT/*.parquet",
+        "/workspace/.cache/huggingface/hub/datasets--HuggingFaceFW--fineweb-edu/snapshots/*/sample/10BT/*.parquet",
+        "/root/.cache/huggingface/hub/datasets--HuggingFaceFW--fineweb-edu/snapshots/*/sample/10BT/*.parquet",
+    ])
+
+    for candidate_glob in candidate_globs:
+        files = sorted(glob.glob(candidate_glob))
+        if files:
+            print(f"Using local parquet glob: {candidate_glob}")
+            return files
+    return []
+
+
+parquet_files = discover_local_parquet_files()
 
 DATA_CACHE_DIR = os.path.join(os.path.dirname(__file__), local_dir)
 os.makedirs(DATA_CACHE_DIR, exist_ok=True)
