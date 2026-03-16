@@ -39,39 +39,21 @@ os.makedirs(DATA_CACHE_DIR, exist_ok=True)
 enc = tiktoken.get_encoding("gpt2")
 eot = enc._special_tokens['<|endoftext|>'] # end of text token
 
-def tokenize_chunk(args):
-    """Worker reads a slice of a parquet file and tokenizes it. No IPC for input data."""
-    filepath, start_row, end_row = args
-    table = pq.read_table(filepath, columns=["text"])
-    col = table.column("text")
-    all_tokens = []
-    for i in range(start_row, min(end_row, len(col))):
-        tokens = [eot]
-        tokens.extend(enc.encode_ordinary(col[i].as_py()))
-        tokens_np = np.array(tokens)
-        assert (0 <= tokens_np).all() and (tokens_np < 2**16).all(), "token dictionary too large for uint16"
-        all_tokens.append(tokens_np.astype(np.uint16))
-    return all_tokens
+def tokenize_text(text):
+    """Tokenize a single text string."""
+    tokens = [eot]
+    tokens.extend(enc.encode_ordinary(text))
+    tokens_np = np.array(tokens)
+    assert (0 <= tokens_np).all() and (tokens_np < 2**16).all(), "token dictionary too large for uint16"
+    return tokens_np.astype(np.uint16)
 
 def write_datafile(filename, tokens_np):
     np.save(filename, tokens_np)
 
-def build_chunk_tasks(parquet_files, rows_per_chunk=1000):
-    """Split each parquet file into row-range chunks for parallel processing."""
-    tasks = []
-    for pf in parquet_files:
-        num_rows = pq.read_metadata(pf).num_rows
-        for start in range(0, num_rows, rows_per_chunk):
-            tasks.append((pf, start, start + rows_per_chunk))
-    return tasks
+nprocs = max(1, os.cpu_count())
 
 if parquet_files:
-    print("Building chunk task list...")
-    chunk_tasks = build_chunk_tasks(parquet_files, rows_per_chunk=1000)
-    print(f"Created {len(chunk_tasks)} chunks across {len(parquet_files)} parquet files")
-
-# tokenize all documents and write output shards, each of shard_size tokens (last shard has remainder)
-nprocs = max(1, os.cpu_count())
+    print(f"Processing {len(parquet_files)} parquet files with {nprocs} workers")
 
 shard_index = 0
 all_tokens_np = np.empty((shard_size,), dtype=np.uint16)
@@ -100,9 +82,15 @@ def process_tokens(tokens):
 
 if parquet_files:
     with mp.Pool(nprocs) as pool:
-        for token_arrays in pool.imap_unordered(tokenize_chunk, chunk_tasks):
-            for tokens in token_arrays:
+        for pf_idx, pf_path in enumerate(parquet_files):
+            print(f"Reading parquet {pf_idx+1}/{len(parquet_files)}...")
+            table = pq.read_table(pf_path, columns=["text"])
+            texts = [table.column("text")[i].as_py() for i in range(len(table))]
+            del table
+            print(f"  Tokenizing {len(texts)} documents...")
+            for tokens in pool.imap(tokenize_text, texts, chunksize=256):
                 process_tokens(tokens)
+            del texts
 else:
     # Streaming fallback (slower, for when parquets aren't available)
     def tokenize_text(text):
