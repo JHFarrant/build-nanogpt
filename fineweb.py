@@ -23,8 +23,8 @@ shard_size = int(1e8) # 100M tokens per shard, total of 100 shards
 DATA_CACHE_DIR = os.path.join(os.path.dirname(__file__), local_dir)
 os.makedirs(DATA_CACHE_DIR, exist_ok=True)
 
-# download the dataset
-fw = load_dataset("HuggingFaceFW/fineweb-edu", name=remote_name, split="train")
+# download the dataset (streaming avoids writing large Arrow cache to disk)
+fw = load_dataset("HuggingFaceFW/fineweb-edu", name=remote_name, split="train", streaming=True)
 
 # init the tokenizer
 enc = tiktoken.get_encoding("gpt2")
